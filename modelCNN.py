@@ -1,19 +1,16 @@
 from flask import Flask, jsonify, request
 import numpy as np
 from keras.models import Sequential
-from keras.layers import Dense, Dropout, Flatten, Conv1D, MaxPooling1D
+from keras.layers import Dense, Flatten, Conv1D, MaxPooling1D
 import pymysql
-from sklearn.metrics import mean_absolute_error
-
-import ConfigurationDB as DB
-import keras
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
+import ConfigurationDB as DB
 
 class modelDL:
+
     def __init__(self):
         self.con = pymysql.connect('localhost', DB.username, DB.password, DB.nameDB)
-        self.originalDateStock = None
-        self.originalPriceCloseStock = None
         self.windowSize = 5
         self.predict = 1
         app = Flask(__name__)
@@ -28,6 +25,9 @@ class modelDL:
                     symbolStock = args["symbolStock"]
                 else:
                     return "Błędnie otrzymany ciąg zapytań!!!", 400
+
+                if "windowSize" in args:
+                    self.windowSize = int(args["windowSize"])
 
                 if "dateStart" in args:
                     dateStart = args.get("dateStart")
@@ -52,24 +52,19 @@ class modelDL:
                 self.buildModel(model)
 
                 date, originalPrice, predictPricePast, predictNextDay = self.trainModel(model, symbolStock, dateStart, dateEnd)
-                result = {}
-                result['trainData'] = []
-                result['predictNextDay'] = []
+                result = {'trainData': [], 'predictNextDay': []}
 
                 for index in range(len(date)):
                     result['trainData'].append({
-                                                'date': str(date[index]),
-                                                'originalPrice': originalPrice[index],
-                                                'predictPrice': predictPricePast[index]
-                                                })
+                        'date': str(date[index]),
+                        'originalPrice': originalPrice[index],
+                        'predictPrice': predictPricePast[index]
+                    })
 
                 result['predictNextDay'].append({
-                                                'date': dateEnd,
-                                                'price': predictNextDay
-                                                })
-
-                print(dateEnd)
-                print(predictNextDay)
+                    'date': dateEnd,
+                    'price': predictNextDay
+                })
 
                 return jsonify(result), 200
 
@@ -80,34 +75,41 @@ class modelDL:
 
     def buildModel(self, model):
 
-        model.add(Dense(128, input_shape=(self.windowSize, 1)))
         model.add(
-            Conv1D(filters=112, kernel_size=1, padding='valid', activation='relu', kernel_initializer="uniform"))
+            Conv1D(input_shape=(self.windowSize, 1), filters=128, kernel_size=1, padding='valid', activation='relu', kernel_initializer="uniform"))
         model.add(MaxPooling1D(pool_size=2, padding='valid'))
         model.add(
-            Conv1D(filters=64, kernel_size=1, padding='valid', activation='relu', kernel_initializer="uniform"))
+            Conv1D(filters=128, kernel_size=1, padding='valid', activation='relu', kernel_initializer="uniform"))
         model.add(MaxPooling1D(pool_size=1, padding='valid'))
-        model.add(Dropout(0.2))
         model.add(Flatten())
-        model.add(Dense(100, activation="relu", kernel_initializer="uniform"))
+        model.add(Dense(64, activation="relu", kernel_initializer="uniform"))
         model.add(Dense(self.predict, activation="relu", kernel_initializer="uniform"))
         model.compile(loss='mse', optimizer='adam', metrics=['mae'])
 
-    def preProcess(self, dateStock, priceStock):
+    def preProcess(self, dateStock, priceStock, minPrice, maxPrice):
 
-        self.trainX = []
-        self.trainY = []
+        batchX = []
+        batchY = []
+        batchDateX = []
+        batchDateY = []
 
-        normPriceClose = self.normalizationMinMax(priceStock, self.originalMinPriceStock, self.originalMaxPriceStock)
+        normPriceClose = self.normalizationMinMax(priceStock, minPrice, maxPrice)
 
         for i in range(self.windowSize, len(dateStock) - self.predict + 1):
             for j in range((i - self.windowSize), i):
-                self.trainX.append(normPriceClose[j])
+                batchX.append(normPriceClose[j])
+                batchDateX.append(dateStock[j])
             for k in range(self.predict):
-                self.trainY.append(normPriceClose[i + k])
+                batchY.append(normPriceClose[i + k])
+                batchDateY.append(dateStock[i + k])
 
-        self.trainX = np.reshape(self.trainX, (int(len(self.trainX) / self.windowSize), self.windowSize, 1))
-        self.trainY = np.reshape(self.trainY, (int(len(self.trainY) / self.predict), self.predict))
+        batchX = np.reshape(batchX, (int(len(batchX) / self.windowSize), self.windowSize, 1))
+        batchY = np.reshape(batchY, (int(len(batchY) / self.predict), self.predict))
+
+        batchDateX = np.reshape(batchDateX, (int(len(batchDateX) / self.windowSize), self.windowSize, 1))
+        batchDateY = np.reshape(batchDateY, (int(len(batchDateY) / self.predict), self.predict))
+
+        return batchX, batchY, batchDateX, batchDateY
 
     def normalizationMinMax(self, priceStock, minPrice, maxPrice):
 
@@ -130,49 +132,66 @@ class modelDL:
     def trainModel(self, model, symbolStock, dateStart, dateEnd):
 
         cursor = self.con.cursor()
-        cursor.execute("SELECT date, price_close FROM companies WHERE symbol = %s AND date >= %s AND date <= %s", (symbolStock, dateStart, dateEnd))
+        cursor.execute(DB.sqlSELECT, (symbolStock, '2015-05-31', '2020-05-31'))
         records = cursor.fetchall()
         cursor.close()
 
-        self.originalDateStock = []
-        self.originalPriceCloseStock = []
+        originalDateStock = []
+        originalPriceCloseStock = []
 
         for record in records:
-            self.originalDateStock.append(str(record[0]))
-            self.originalPriceCloseStock.append((record[1]))
+            originalDateStock.append(str(record[0]))
+            originalPriceCloseStock.append((record[1]))
 
-        self.originalMinPriceStock = min(self.originalPriceCloseStock)
-        self.originalMaxPriceStock = max(self.originalPriceCloseStock)
+        originalMinPriceStock = min(originalPriceCloseStock)
+        originalMaxPriceStock = max(originalPriceCloseStock)
 
-        self.preProcess(self.originalDateStock, self.originalPriceCloseStock)
+        trainX, trainY, trainDateX, trainDateY = self.preProcess(originalDateStock, originalPriceCloseStock, originalMinPriceStock, originalMaxPriceStock)
 
-        history_fit = model.fit(self.trainX, self.trainY, validation_split=0.2, batch_size=128, epochs=35, verbose=2)
+        history_fit = model.fit(trainX, trainY, validation_split=0.2, batch_size=128, epochs=100, verbose=0)
 
-        predictTrainY = model.predict(self.trainX)
+        predictTrainY = model.predict(trainX)
         predictTrainY = np.reshape(predictTrainY, predictTrainY.shape[0] * self.predict)
-        predictTrainY = self.inverseNormalizationMinMax(predictTrainY, self.originalMinPriceStock, self.originalMaxPriceStock)
+        predictTrainY = self.inverseNormalizationMinMax(predictTrainY, originalMinPriceStock, originalMaxPriceStock)
 
-        predicXNextDay = self.originalPriceCloseStock[-5:]
-        predicXNextDay = self.normalizationMinMax(predicXNextDay, self.originalMinPriceStock, self.originalMaxPriceStock)
+        cursor = self.con.cursor()
+        cursor.execute(DB.sqlSELECT2, (symbolStock, dateStart, dateEnd, self.windowSize))
+        records = cursor.fetchall()
+        cursor.close()
+
+        originalDateStockNexdDay = []
+        originalPriceCloseStockNexdDay = []
+
+        for record in records:
+            originalDateStockNexdDay.append(str(record[0]))
+            originalPriceCloseStockNexdDay.append((record[1]))
+
+        originalDateStockNexdDay.reverse()
+        originalPriceCloseStockNexdDay.reverse()
+
+        originalMinPriceStockNextDay = min(originalPriceCloseStockNexdDay)
+        originalMaxPriceStockNextDay = max(originalPriceCloseStockNexdDay)
+
+        predicXNextDay = self.normalizationMinMax(originalPriceCloseStockNexdDay, originalMinPriceStockNextDay, originalMaxPriceStockNextDay)
         predicXNextDay = np.reshape(predicXNextDay, (int(len(predicXNextDay) / self.windowSize), self.windowSize, 1))
 
         predicYNextDay = model.predict(predicXNextDay)
         predicYNextDay = np.reshape(predicYNextDay, predicYNextDay.shape[0] * 1)
-        predicYNextDay = self.inverseNormalizationMinMax(predicYNextDay, self.originalMinPriceStock, self.originalMaxPriceStock)
+        predicYNextDay = self.inverseNormalizationMinMax(predicYNextDay, originalMinPriceStockNextDay, originalMaxPriceStockNextDay)
 
         loss_values = history_fit.history['loss']
         val_loss_values = history_fit.history['val_loss']
         epochs = range(1, len(loss_values) + 1)
         plt.plot(epochs, loss_values, 'b', color = 'blue', label='Training loss')
         plt.plot(epochs, val_loss_values, 'b', color='red', label='Validation loss')
-        plt.rc('font', size=18)
         plt.title('Training and validation loss')
         plt.xlabel('Epochs')
-        plt.ylabel('Loss')
+        plt.ylabel('MSE')
         plt.legend()
         plt.xticks(epochs)
+        plt.rc('font', size=10)
         fig = plt.gcf()
-        fig.set_size_inches(15, 7)
+        fig.set_size_inches(18, 7)
         plt.show()
 
         mae = history_fit.history['mae']
@@ -182,34 +201,28 @@ class modelDL:
         plt.plot(epochs, vmae, 'b', color='red', label='Validation error')
         plt.title('Training and validation error')
         plt.xlabel('Epochs')
-        plt.ylabel('Error')
+        plt.ylabel('MAE')
         plt.legend()
         plt.xticks(epochs)
+        plt.rc('font', size=10)
         fig = plt.gcf()
-        fig.set_size_inches(15, 7)
+        fig.set_size_inches(18, 7)
         plt.show()
 
         ###############################################
-        print(self.trainY.shape)
-
-        self.trainY = np.reshape(self.trainY, self.trainY.shape[0]*self.predict)
-        self.trainY = self.inverseNormalizationMinMax(self.trainY, self.originalMinPriceStock, self.originalMaxPriceStock)
-        self.trainY = np.reshape(self.trainY, (int(len(self.trainY) / self.predict), self.predict))
+        trainY = np.reshape(trainY, trainY.shape[0] * self.predict)
+        trainY = self.inverseNormalizationMinMax(trainY, originalMinPriceStock, originalMaxPriceStock)
+        trainY = np.reshape(trainY, (int(len(trainY) / self.predict), self.predict))
 
         predictTrainY = np.reshape(predictTrainY, (int(len(predictTrainY) / self.predict), self.predict))
 
-        print(self.originalPriceCloseStock[0])
-        print(self.trainX[0])
-
-        
-
-        print(predictTrainY[0])
-
-        print('mean absolute error \t mean absolute percentage error')
-        print((mean_absolute_error(self.trainY, predictTrainY)), '\t', (np.mean(np.abs((self.trainY - predictTrainY) / self.trainY)) * 100))
+        print('MAE \t MSE \t MAPE')
+        print(mean_absolute_error(trainY, predictTrainY), '\t', mean_squared_error(trainY, predictTrainY), '\t', (np.mean(np.abs((trainY - predictTrainY) / trainY)) * 100))
         predictTrainY = np.reshape(predictTrainY, predictTrainY.shape[0] * self.predict)
         #################################################
 
-        return self.originalDateStock[5:len(self.originalDateStock)], self.originalPriceCloseStock[5:len(self.originalPriceCloseStock)], predictTrainY, predicYNextDay[0]
+        return originalDateStock[self.windowSize:len(originalDateStock)], \
+               originalPriceCloseStock[self.windowSize:len(originalPriceCloseStock)], \
+               predictTrainY, round(predicYNextDay[0], 2)
 
 modelDL()
